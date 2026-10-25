@@ -1,0 +1,4 @@
+gradio
+supabase
+pandas
+openpyxl
