@@ -1,4 +1,0 @@
-gradio
-supabase
-pandas
-openpyxl
