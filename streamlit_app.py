@@ -15,7 +15,9 @@ import streamlit as st
 from supabase import create_client
 
 TABEL = "formulasi"
-KOLOM = ["id", "jenis_kulit", "tahapan", "senyawa", "persen"]
+KOLOM = ["id", "jenis_kulit", "tahapan", "senyawa", "persen", "satuan"]
+# Faktor konversi dari kg: g dan mL (asumsi massa jenis 1 kg = 1 L) dikali 1000
+SATUAN = {"kg": 1, "g": 1000, "mL": 1000, "L": 1}
 BARU = "➕ Tambah baru..."
 
 st.set_page_config(page_title="DSS Kimia Pengolahan Kulit", page_icon="🧪", layout="wide")
@@ -58,6 +60,8 @@ def jalankan(fn):
         teks = str(e)
         if "23505" in teks or "duplicate" in teks.lower():
             raise DBError("Data duplikat: kombinasi jenis kulit + tahapan + senyawa sudah ada.")
+        if "satuan" in teks and ("column" in teks or "PGRST204" in teks):
+            raise DBError("Kolom 'satuan' belum ada. Jalankan migrasi SQL di Supabase SQL Editor.")
         if "does not exist" in teks or "PGRST205" in teks:
             raise DBError("Tabel 'formulasi' belum ada. Jalankan setup.sql di Supabase SQL Editor.")
         raise DBError(f"Gagal mengakses database: {teks[:200]}")
@@ -71,6 +75,9 @@ def ambil_semua() -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=KOLOM)
     df["persen"] = df["persen"].astype(float)
+    if "satuan" not in df:
+        df["satuan"] = "kg"
+    df["satuan"] = df["satuan"].fillna("kg")
     return df[KOLOM]
 
 
@@ -154,12 +161,14 @@ def halaman_developer():
         jenis = pilih_atau_baru("Jenis kulit", jenis_list, "jenis")
     with c2:
         tahapan = pilih_atau_baru("Tahapan", tahap_list, "tahap")
-    c3, c4 = st.columns(2)
+    c3, c4, c5 = st.columns([2, 2, 1])
     with c3:
         senyawa = st.text_input("Nama senyawa kimia", key="senyawa")
     with c4:
         persen = st.number_input("Persentase (% dari berat kulit)",
                                  min_value=0.0, value=None, format="%.4f", key="persen")
+    with c5:
+        satuan = st.selectbox("Satuan output", list(SATUAN), key="satuan")
 
     if st.button("➕ Tambah", type="primary"):
         jenis, tahapan = rapikan(jenis).title(), rapikan(tahapan).title()
@@ -172,11 +181,12 @@ def halaman_developer():
             try:
                 jalankan(lambda: db().table(TABEL).insert({
                     "jenis_kulit": jenis, "tahapan": tahapan,
-                    "senyawa": senyawa, "persen": persen}).execute())
+                    "senyawa": senyawa, "persen": persen,
+                    "satuan": satuan}).execute())
             except DBError as e:
                 st.error(f"❌ {e}")
             else:
-                flash("success", f"✅ Ditambahkan: {jenis} / {tahapan} / {senyawa} ({persen}%)")
+                flash("success", f"✅ Ditambahkan: {jenis} / {tahapan} / {senyawa} ({persen}%, output {satuan})")
 
     st.divider()
     st.subheader("Data formulasi (klik satu baris untuk edit / hapus)")
@@ -193,20 +203,27 @@ def halaman_developer():
     row = df.iloc[baris[0]]
     st.write(f"Terpilih: **{row['jenis_kulit']} / {row['tahapan']} / {row['senyawa']}** "
              f"(ID {int(row['id'])}, {row['persen']}%)")
-    persen_baru = st.number_input("Persentase baru (%)", min_value=0.0,
-                                  value=float(row["persen"]), format="%.4f", key="persen_baru")
+    ce1, ce2 = st.columns([2, 1])
+    with ce1:
+        persen_baru = st.number_input("Persentase baru (%)", min_value=0.0,
+                                      value=float(row["persen"]), format="%.4f",
+                                      key=f"persen_baru_{int(row['id'])}")
+    with ce2:
+        satuan_baru = st.selectbox("Satuan baru", list(SATUAN),
+                                   index=list(SATUAN).index(row["satuan"]) if row["satuan"] in SATUAN else 0,
+                                   key=f"satuan_baru_{int(row['id'])}")
     cu, ch = st.columns(2)
-    if cu.button("✏️ Ubah persentase"):
+    if cu.button("✏️ Ubah persentase & satuan"):
         if persen_baru <= 0:
             st.warning("⚠️ Persentase harus angka lebih dari 0.")
         else:
             try:
-                jalankan(lambda: db().table(TABEL).update({"persen": persen_baru})
+                jalankan(lambda: db().table(TABEL).update({"persen": persen_baru, "satuan": satuan_baru})
                          .eq("id", int(row["id"])).execute())
             except DBError as e:
                 st.error(f"❌ {e}")
             else:
-                flash("success", f"✅ Persentase ID {int(row['id'])} diubah jadi {persen_baru}%")
+                flash("success", f"✅ ID {int(row['id'])} diubah: {persen_baru}%, satuan {satuan_baru}")
     if ch.button("🗑️ Hapus baris"):
         try:
             jalankan(lambda: db().table(TABEL).delete().eq("id", int(row["id"])).execute())
@@ -249,22 +266,25 @@ def halaman_user():
         return
 
     hasil = df[(df["jenis_kulit"] == jenis) & (df["tahapan"] == tahapan)].copy()
-    hasil["berat_kg"] = (hasil["persen"] / 100 * berat).round(4)
-    tampil = hasil[["senyawa", "persen", "berat_kg"]].rename(columns={
-        "senyawa": "Senyawa", "persen": "Persen (%)", "berat_kg": "Berat (kg)"})
+    # jumlah dasar (kg) lalu dikonversi ke satuan masing-masing senyawa
+    hasil["jumlah"] = (hasil["persen"] / 100 * berat
+                       * hasil["satuan"].map(SATUAN).fillna(1)).round(4)
+    tampil = hasil[["senyawa", "persen", "jumlah", "satuan"]].rename(columns={
+        "senyawa": "Senyawa", "persen": "Persen (%)", "jumlah": "Jumlah", "satuan": "Satuan"})
     st.dataframe(tampil, hide_index=True, use_container_width=True)
-    total = hasil["berat_kg"].sum()
-    st.markdown(f"**Total bahan kimia: {total:,.4f} kg** untuk {berat:g} kg kulit {jenis} ({tahapan})")
+    per_satuan = hasil.groupby("satuan")["jumlah"].sum()
+    ringkas = " + ".join(f"{v:,.4f} {k}" for k, v in per_satuan.items())
+    st.markdown(f"**Total:** {ringkas} untuk {berat:g} kg kulit {jenis} ({tahapan})")
+    st.caption("Satuan g dan mL dihitung dari kg dengan asumsi massa jenis 1 kg = 1 L.")
 
     # Export xlsx
     out = pd.DataFrame({
         "Jenis Kulit": jenis, "Tahapan": tahapan, "Berat Kulit (kg)": berat,
         "Senyawa": hasil["senyawa"].values, "Persen (%)": hasil["persen"].values,
-        "Berat Senyawa (kg)": hasil["berat_kg"].values})
+        "Jumlah": hasil["jumlah"].values, "Satuan": hasil["satuan"].values})
     baris_total = pd.DataFrame([{
         "Jenis Kulit": jenis, "Tahapan": tahapan, "Berat Kulit (kg)": berat,
-        "Senyawa": "TOTAL", "Persen (%)": out["Persen (%)"].sum(),
-        "Berat Senyawa (kg)": out["Berat Senyawa (kg)"].sum()}])
+        "Senyawa": "TOTAL", "Persen (%)": None, "Jumlah": None, "Satuan": ringkas}])
     out = pd.concat([out, baris_total], ignore_index=True)
     buf = io.BytesIO()
     out.to_excel(buf, index=False, engine="openpyxl")
