@@ -16,8 +16,9 @@ from supabase import create_client
 
 TABEL = "formulasi"
 KOLOM = ["id", "jenis_kulit", "tahapan", "senyawa", "persen", "satuan"]
-# Faktor konversi dari kg: g dan mL (asumsi massa jenis 1 kg = 1 L) dikali 1000
-SATUAN = {"kg": 1, "g": 1000, "mL": 1000, "L": 1}
+# Faktor konversi dari gram (berat kulit dalam g -> jumlah senyawa dalam g).
+# mL dan L memakai asumsi massa jenis 1 g = 1 mL.
+SATUAN = {"g": 1, "kg": 0.001, "mL": 1, "L": 0.001}
 BARU = "➕ Tambah baru..."
 
 st.set_page_config(page_title="DSS Kimia Pengolahan Kulit", page_icon="🧪", layout="wide")
@@ -257,16 +258,16 @@ def halaman_user():
         tahapan = st.selectbox("Tahapan", tahap_opsi, index=None,
                                placeholder="Pilih tahapan")
     with c3:
-        berat = st.number_input("Berat kulit (kg)", min_value=0.0, value=None, format="%.3f")
+        berat = st.number_input("Berat kulit (g)", min_value=0.0, value=None, format="%.3f")
 
     if not (jenis and tahapan):
         return
     if berat is None or berat <= 0:
-        st.info("Masukkan berat kulit (kg) lebih dari 0.")
+        st.info("Masukkan berat kulit (g) lebih dari 0.")
         return
 
     hasil = df[(df["jenis_kulit"] == jenis) & (df["tahapan"] == tahapan)].copy()
-    # jumlah dasar (kg) lalu dikonversi ke satuan masing-masing senyawa
+    # jumlah dasar (g) lalu dikonversi ke satuan masing-masing senyawa
     hasil["jumlah"] = (hasil["persen"] / 100 * berat
                        * hasil["satuan"].map(SATUAN).fillna(1)).round(4)
     tampil = hasil[["senyawa", "persen", "jumlah", "satuan"]].rename(columns={
@@ -274,16 +275,16 @@ def halaman_user():
     st.dataframe(tampil, hide_index=True, use_container_width=True)
     per_satuan = hasil.groupby("satuan")["jumlah"].sum()
     ringkas = " + ".join(f"{v:,.4f} {k}" for k, v in per_satuan.items())
-    st.markdown(f"**Total:** {ringkas} untuk {berat:g} kg kulit {jenis} ({tahapan})")
-    st.caption("Satuan g dan mL dihitung dari kg dengan asumsi massa jenis 1 kg = 1 L.")
+    st.markdown(f"**Total:** {ringkas} untuk {berat:g} g kulit {jenis} ({tahapan})")
+    st.caption("Satuan mL dan L dihitung dari gram dengan asumsi massa jenis 1 g = 1 mL.")
 
     # Export xlsx
     out = pd.DataFrame({
-        "Jenis Kulit": jenis, "Tahapan": tahapan, "Berat Kulit (kg)": berat,
+        "Jenis Kulit": jenis, "Tahapan": tahapan, "Berat Kulit (g)": berat,
         "Senyawa": hasil["senyawa"].values, "Persen (%)": hasil["persen"].values,
         "Jumlah": hasil["jumlah"].values, "Satuan": hasil["satuan"].values})
     baris_total = pd.DataFrame([{
-        "Jenis Kulit": jenis, "Tahapan": tahapan, "Berat Kulit (kg)": berat,
+        "Jenis Kulit": jenis, "Tahapan": tahapan, "Berat Kulit (g)": berat,
         "Senyawa": "TOTAL", "Persen (%)": None, "Jumlah": None, "Satuan": ringkas}])
     out = pd.concat([out, baris_total], ignore_index=True)
     buf = io.BytesIO()
