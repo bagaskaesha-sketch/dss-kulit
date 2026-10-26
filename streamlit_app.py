@@ -11,6 +11,7 @@ import os
 import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
+from itertools import groupby
 
 import pandas as pd
 import streamlit as st
@@ -19,7 +20,7 @@ from openpyxl.styles import Alignment, Border, Font, Side
 from supabase import create_client
 
 TABEL = "formulasi"
-KOLOM = ["id", "jenis_kulit", "tahapan", "senyawa", "persen", "satuan"]
+KOLOM = ["id", "jenis_kulit", "tahapan", "senyawa", "persen", "satuan", "fase"]
 # Faktor konversi dari gram (berat kulit dalam g -> jumlah senyawa dalam g).
 # mL dan L memakai asumsi massa jenis 1 g = 1 mL.
 SATUAN = {"g": 1, "kg": 0.001, "mL": 1, "L": 0.001}
@@ -65,8 +66,8 @@ def jalankan(fn):
         teks = str(e)
         if "23505" in teks or "duplicate" in teks.lower():
             raise DBError("Data duplikat: kombinasi jenis kulit + tahapan + senyawa sudah ada.")
-        if "satuan" in teks and ("column" in teks or "PGRST204" in teks):
-            raise DBError("Kolom 'satuan' belum ada. Jalankan migrasi SQL di Supabase SQL Editor.")
+        if ("satuan" in teks or "fase" in teks) and ("column" in teks or "PGRST204" in teks):
+            raise DBError("Kolom baru (satuan/fase) belum ada. Jalankan migrasi SQL terbaru di Supabase SQL Editor.")
         if "does not exist" in teks or "PGRST205" in teks:
             raise DBError("Tabel database belum ada. Jalankan setup.sql dan semua file migrasi di Supabase SQL Editor.")
         raise DBError(f"Gagal mengakses database: {teks[:200]}")
@@ -83,13 +84,17 @@ def ambil_semua() -> pd.DataFrame:
     if "satuan" not in df:
         df["satuan"] = "kg"
     df["satuan"] = df["satuan"].fillna("kg")
+    if "fase" not in df:
+        df["fase"] = 1
+    df["fase"] = pd.to_numeric(df["fase"], errors="coerce").fillna(1).astype(int)
     return df[KOLOM]
 
 
 def ambil_info() -> dict:
-    """Waktu & keterangan per (jenis kulit, tahapan)."""
+    """Waktu & keterangan per (jenis kulit, tahapan, fase)."""
     res = jalankan(lambda: db().table("tahapan_info").select("*").execute())
-    return {(r["jenis_kulit"], r["tahapan"]): (r.get("waktu") or "", r.get("keterangan") or "")
+    return {(r["jenis_kulit"], r["tahapan"], int(r.get("fase") or 1)):
+            (r.get("waktu") or "", r.get("keterangan") or "")
             for r in (res.data or [])}
 
 
@@ -156,9 +161,12 @@ def pilih_atau_baru(label: str, pilihan: list, kunci: str) -> str:
 
 
 def bagian_info_tahapan(df: pd.DataFrame):
-    """Atur waktu (menit) dan keterangan untuk tiap tahapan."""
+    """Atur waktu (menit) dan keterangan untuk tiap fase dalam sebuah tahapan."""
     st.divider()
-    st.subheader("Waktu & keterangan per tahapan")
+    st.subheader("Waktu & keterangan per fase")
+    st.caption("Senyawa dengan nomor fase sama dikerjakan bersamaan (berbagi waktu & keterangan). "
+               "Contoh Netralisasi: Air + Natrium Format = fase 1 (30 menit); "
+               "Soda Kue = fase 2 (3 x 20, cek pH).")
     if df.empty:
         st.info("Tambahkan formulasi dulu.")
         return
@@ -168,15 +176,22 @@ def bagian_info_tahapan(df: pd.DataFrame):
         st.error(f"❌ {e}")
         return
 
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns([2, 2, 1])
     with c1:
         jenis = st.selectbox("Jenis kulit", sorted(df["jenis_kulit"].unique().tolist()),
                              key="info_jenis")
     with c2:
         tahap_opsi = list(dict.fromkeys(df[df["jenis_kulit"] == jenis]["tahapan"]))
         tahapan = st.selectbox("Tahapan", tahap_opsi, key="info_tahap")
-    lama_w, lama_k = info.get((jenis, tahapan), ("", ""))
-    kunci = f"{jenis}|{tahapan}"  # key berubah -> isian ikut ter-reset ke data tersimpan
+    sub = df[(df["jenis_kulit"] == jenis) & (df["tahapan"] == tahapan)]
+    with c3:
+        fase = st.selectbox("Fase", sorted(sub["fase"].unique().tolist()), key="info_fase")
+    fase = int(fase)
+    isi = ", ".join(sub[sub["fase"] == fase]["senyawa"])
+    st.caption(f"Senyawa di fase ini: {isi}")
+
+    lama_w, lama_k = info.get((jenis, tahapan, fase), ("", ""))
+    kunci = f"{jenis}|{tahapan}|{fase}"  # key berubah -> isian ikut ter-reset ke data tersimpan
     waktu = st.text_input("Waktu (menit)", value=lama_w, key=f"waktu_{kunci}",
                           placeholder="contoh: 30  atau  3 x 20")
     ket = st.text_area("Keterangan (opsional)", value=lama_k, key=f"ket_{kunci}",
@@ -186,21 +201,23 @@ def bagian_info_tahapan(df: pd.DataFrame):
         try:
             if not waktu and not ket:
                 jalankan(lambda: db().table("tahapan_info").delete()
-                         .eq("jenis_kulit", jenis).eq("tahapan", tahapan).execute())
-                flash("success", f"🗑️ Info {jenis} / {tahapan} dikosongkan.")
+                         .eq("jenis_kulit", jenis).eq("tahapan", tahapan)
+                         .eq("fase", fase).execute())
+                flash("success", f"🗑️ Info {jenis} / {tahapan} / fase {fase} dikosongkan.")
             else:
                 jalankan(lambda: db().table("tahapan_info").upsert(
-                    {"jenis_kulit": jenis, "tahapan": tahapan, "waktu": waktu,
-                     "keterangan": ket}, on_conflict="jenis_kulit,tahapan").execute())
-                flash("success", f"✅ Tersimpan: {jenis} / {tahapan}")
+                    {"jenis_kulit": jenis, "tahapan": tahapan, "fase": fase,
+                     "waktu": waktu, "keterangan": ket},
+                    on_conflict="jenis_kulit,tahapan,fase").execute())
+                flash("success", f"✅ Tersimpan: {jenis} / {tahapan} / fase {fase}")
         except DBError as e:
             st.error(f"❌ {e}")
 
     if info:
         st.caption("Info yang sudah tersimpan:")
         st.dataframe(pd.DataFrame(
-            [{"Jenis Kulit": j, "Tahapan": t, "Waktu (menit)": w, "Keterangan": k}
-             for (j, t), (w, k) in sorted(info.items())]),
+            [{"Jenis Kulit": j, "Tahapan": t, "Fase": f, "Waktu (menit)": w, "Keterangan": k}
+             for (j, t, f), (w, k) in sorted(info.items())]),
             hide_index=True, use_container_width=True)
 
 
@@ -222,7 +239,7 @@ def halaman_developer():
         jenis = pilih_atau_baru("Jenis kulit", jenis_list, "jenis")
     with c2:
         tahapan = pilih_atau_baru("Tahapan", tahap_list, "tahap")
-    c3, c4, c5 = st.columns([2, 2, 1])
+    c3, c4, c5, c6 = st.columns([2, 2, 1, 1])
     with c3:
         senyawa = st.text_input("Nama senyawa kimia", key="senyawa")
     with c4:
@@ -230,6 +247,10 @@ def halaman_developer():
                                  min_value=0.0, value=None, format="%.4f", key="persen")
     with c5:
         satuan = st.selectbox("Satuan output", list(SATUAN), key="satuan")
+    with c6:
+        fase = st.number_input("Fase", min_value=1, value=1, step=1, key="fase",
+                               help="Senyawa dengan fase sama dikerjakan bersamaan "
+                                    "(waktu & keterangan sama). Fase 1 dulu, lalu fase 2, dst.")
 
     if st.button("➕ Tambah", type="primary"):
         jenis, tahapan = rapikan(jenis).title(), rapikan(tahapan).title()
@@ -243,11 +264,11 @@ def halaman_developer():
                 jalankan(lambda: db().table(TABEL).insert({
                     "jenis_kulit": jenis, "tahapan": tahapan,
                     "senyawa": senyawa, "persen": persen,
-                    "satuan": satuan}).execute())
+                    "satuan": satuan, "fase": int(fase)}).execute())
             except DBError as e:
                 st.error(f"❌ {e}")
             else:
-                flash("success", f"✅ Ditambahkan: {jenis} / {tahapan} / {senyawa} ({persen}%, output {satuan})")
+                flash("success", f"✅ Ditambahkan: {jenis} / {tahapan} / {senyawa} ({persen}%, output {satuan}, fase {int(fase)})")
 
     bagian_info_tahapan(df)
 
@@ -266,7 +287,7 @@ def halaman_developer():
     row = df.iloc[baris[0]]
     st.write(f"Terpilih: **{row['jenis_kulit']} / {row['tahapan']} / {row['senyawa']}** "
              f"(ID {int(row['id'])}, {row['persen']}%)")
-    ce1, ce2 = st.columns([2, 1])
+    ce1, ce2, ce3 = st.columns([2, 1, 1])
     with ce1:
         persen_baru = st.number_input("Persentase baru (%)", min_value=0.0,
                                       value=float(row["persen"]), format="%.4f",
@@ -275,18 +296,22 @@ def halaman_developer():
         satuan_baru = st.selectbox("Satuan baru", list(SATUAN),
                                    index=list(SATUAN).index(row["satuan"]) if row["satuan"] in SATUAN else 0,
                                    key=f"satuan_baru_{int(row['id'])}")
+    with ce3:
+        fase_baru = st.number_input("Fase baru", min_value=1, value=int(row["fase"]), step=1,
+                                    key=f"fase_baru_{int(row['id'])}")
     cu, ch = st.columns(2)
-    if cu.button("✏️ Ubah persentase & satuan"):
+    if cu.button("✏️ Ubah persentase, satuan & fase"):
         if persen_baru <= 0:
             st.warning("⚠️ Persentase harus angka lebih dari 0.")
         else:
             try:
-                jalankan(lambda: db().table(TABEL).update({"persen": persen_baru, "satuan": satuan_baru})
+                jalankan(lambda: db().table(TABEL).update({"persen": persen_baru, "satuan": satuan_baru,
+                                                              "fase": int(fase_baru)})
                          .eq("id", int(row["id"])).execute())
             except DBError as e:
                 st.error(f"❌ {e}")
             else:
-                flash("success", f"✅ ID {int(row['id'])} diubah: {persen_baru}%, satuan {satuan_baru}")
+                flash("success", f"✅ ID {int(row['id'])} diubah: {persen_baru}%, satuan {satuan_baru}, fase {int(fase_baru)}")
     if ch.button("🗑️ Hapus baris"):
         try:
             jalankan(lambda: db().table(TABEL).delete().eq("id", int(row["id"])).execute())
@@ -324,11 +349,15 @@ def angka(teks: str) -> float:
     return float(str(teks).strip().replace(",", "."))
 
 
-def hitung_langkah(df: pd.DataFrame, jenis, tahapan, berat) -> pd.DataFrame:
+def hitung_langkah(df: pd.DataFrame, jenis, tahapan, berat, info=None) -> pd.DataFrame:
+    info = info or {}
     h = df[(df["jenis_kulit"] == jenis) & (df["tahapan"] == tahapan)].copy()
+    h = h.sort_values(["fase", "id"], kind="stable")
     # berat kulit dalam g -> jumlah senyawa dikonversi ke satuan masing-masing
     h["jumlah"] = (h["persen"] / 100 * berat * h["satuan"].map(SATUAN).fillna(1)).round(4)
-    return h[["senyawa", "persen", "jumlah", "satuan"]]
+    h["waktu"] = [info.get((jenis, tahapan, f), ("", ""))[0] for f in h["fase"]]
+    h["keterangan"] = [info.get((jenis, tahapan, f), ("", ""))[1] for f in h["fase"]]
+    return h[["senyawa", "persen", "jumlah", "satuan", "fase", "waktu", "keterangan"]]
 
 
 def ringkas_satuan(rows: pd.DataFrame) -> str:
@@ -337,8 +366,12 @@ def ringkas_satuan(rows: pd.DataFrame) -> str:
 
 
 def tabel_tampil(rows) -> pd.DataFrame:
-    return pd.DataFrame(rows).rename(columns={
-        "senyawa": "Senyawa", "persen": "Persen (%)", "jumlah": "Jumlah", "satuan": "Satuan"})
+    kolom = ["senyawa", "persen", "jumlah", "satuan", "fase", "waktu", "keterangan"]
+    d = pd.DataFrame(rows).reindex(columns=kolom)
+    d[["waktu", "keterangan"]] = d[["waktu", "keterangan"]].fillna("")
+    return d.rename(columns={
+        "senyawa": "Senyawa", "persen": "Persen (%)", "jumlah": "Jumlah", "satuan": "Satuan",
+        "fase": "Fase", "waktu": "Waktu (menit)", "keterangan": "Keterangan"})
 
 
 KONFIG_TABEL = {"Jumlah": st.column_config.NumberColumn("Jumlah", format="%.2f")}
@@ -366,7 +399,8 @@ def ubah_tanggal(a) -> str:
 
 def baca_file(f):
     """Baca file Kartu Kendali Proses (hasil export app ini atau tulisan manual).
-    Return (daftar_langkah, info) dengan info = {'penyamak': ...}."""
+    Return (daftar_langkah, info) dengan info = {'penyamak': ...}.
+    Baris yang kolom Waktu-nya digabung (merge) dianggap satu fase."""
     wb = load_workbook(f, data_only=True)
     ws = wb["Kartu Kendali"] if "Kartu Kendali" in wb.sheetnames else wb.worksheets[0]
 
@@ -384,6 +418,12 @@ def baca_file(f):
         raise ValueError("Header tabel (Tanggal, Proses, Bahan Kimia, ...) tidak ditemukan. "
                          "Pakai file Kartu Kendali Proses.")
 
+    grup_e = {}  # baris -> baris pertama dari sel Waktu yang digabung
+    for rng in ws.merged_cells.ranges:
+        if rng.min_col <= 5 <= rng.max_col:
+            for rr in range(rng.min_row, rng.max_row + 1):
+                grup_e[rr] = rng.min_row
+
     daftar, cur, jenis, berat, tgl, gagal = [], None, None, None, "", 0
     for r in range(mulai, ws.max_row + 1):
         a, b, c, d = (ws.cell(r, k).value for k in (1, 2, 3, 4))
@@ -397,25 +437,35 @@ def baca_file(f):
             if jenis is None:
                 continue
             cur = {"tanggal": tgl, "jenis": jenis, "tahapan": b.strip(),
-                   "berat": berat, "rows": [], "_w": [], "_k": []}
+                   "berat": berat, "rows": [], "_grup": {}}
             daftar.append(cur)
-        if cur is not None:  # kumpulkan Waktu (kol E) dan Keterangan (kol F) di baris tahapan
-            for v, kunci in ((ws.cell(r, 5).value, "_w"), (ws.cell(r, 6).value, "_k")):
-                t = nilai_teks(v)
-                if t and t not in cur[kunci]:
-                    cur[kunci].append(t)
-        if cur is not None and isinstance(c, str) and c.strip() and d is not None:
+        if cur is None:
+            continue
+        gid = grup_e.get(r, -r)  # baris tak digabung = fase sendiri
+        g = cur["_grup"].setdefault(gid, {"w": [], "k": []})
+        for v, kunci in ((ws.cell(r, 5).value, "w"), (ws.cell(r, 6).value, "k")):
+            t = nilai_teks(v)
+            if t and t not in g[kunci]:
+                g[kunci].append(t)
+        if isinstance(c, str) and c.strip() and d is not None:
             m = POLA_JUMLAH.match(str(d))
             if m:
                 cur["rows"].append({
                     "senyawa": c.strip(), "persen": angka(m.group(1)),
                     "jumlah": angka(m.group(2)),
-                    "satuan": UNIT_BALIK[m.group(3).lower()]})
+                    "satuan": UNIT_BALIK[m.group(3).lower()], "_gid": gid})
             else:
                 gagal += 1
+
     for e in daftar:
-        e["waktu"] = "; ".join(e.pop("_w"))
-        e["keterangan"] = "; ".join(e.pop("_k"))
+        urut = {}
+        for row in e["rows"]:
+            gid = row.pop("_gid")
+            urut.setdefault(gid, len(urut) + 1)
+            row["fase"] = urut[gid]
+            row["waktu"] = "; ".join(e["_grup"][gid]["w"])
+            row["keterangan"] = "; ".join(e["_grup"][gid]["k"])
+        e.pop("_grup")
     daftar = [e for e in daftar if e["rows"]]
     if not daftar:
         raise ValueError("Tidak ada langkah yang bisa dibaca dari file ini.")
@@ -474,28 +524,34 @@ def buat_excel(daftar: list, penyamak: str = "") -> bytes:
                 ws.cell(r, 1).value = e["tanggal"]
         tgl_sebelumnya = e["tanggal"]
         r += 1
-        # Baris bahan kimia; Waktu dan Keterangan diisi dari data tahapan (digabung per tahapan)
-        awal = r
-        for j, row in enumerate(e["rows"]):
-            isi_baris(r, {
-                2: e["tahapan"] if j == 0 else None,
-                3: row["senyawa"],
-                4: f"{fmt_angka(row['persen'], 4)} "
-                   f"({fmt_angka(row['jumlah'], 2, True)} {UNIT_XLS.get(row['satuan'], row['satuan'])})"})
-            r += 1
-        waktu = (e.get("waktu") or "").strip()
-        ket = (e.get("keterangan") or "").strip()
-        if waktu:
-            ws.cell(awal, 5).value = angka(waktu) if re.fullmatch(r"\d+([.,]\d+)?", waktu) else waktu
-        if ket:
-            ws.cell(awal, 6).value = ket
-        if r - 1 > awal:
-            for kol in (5, 6):
-                ws.merge_cells(start_row=awal, start_column=kol, end_row=r - 1, end_column=kol)
-        # tinggi baris agar keterangan panjang tidak terpotong (sel gabungan tidak auto-fit)
-        baris_perlu = sum(max(1, -(-len(x) // 24)) for x in ket.split("\n")) if ket else 1
-        if baris_perlu > r - awal:
-            ws.row_dimensions[awal].height = 15.75 * (1 + baris_perlu - (r - awal))
+        # Bahan kimia per fase; Waktu & Keterangan digabung per fase
+        pertama = True
+        for _, grup in groupby(e["rows"], key=lambda x: x.get("fase", 1)):
+            grup = list(grup)
+            awal = r
+            for row in grup:
+                isi_baris(r, {
+                    2: e["tahapan"] if pertama else None,
+                    3: row["senyawa"],
+                    4: f"{fmt_angka(row['persen'], 4)} "
+                       f"({fmt_angka(row['jumlah'], 2, True)} "
+                       f"{UNIT_XLS.get(row['satuan'], row['satuan'])})"})
+                pertama = False
+                r += 1
+            waktu = (grup[0].get("waktu") or "").strip()
+            ket = (grup[0].get("keterangan") or "").strip()
+            if waktu:
+                ws.cell(awal, 5).value = (angka(waktu) if re.fullmatch(r"\d+([.,]\d+)?", waktu)
+                                          else waktu)
+            if ket:
+                ws.cell(awal, 6).value = ket
+            if r - 1 > awal:
+                for kol in (5, 6):
+                    ws.merge_cells(start_row=awal, start_column=kol, end_row=r - 1, end_column=kol)
+            # tinggi baris agar keterangan panjang tidak terpotong (sel gabungan tidak auto-fit)
+            perlu = sum(max(1, -(-len(x) // 24)) for x in ket.split("\n")) if ket else 1
+            if perlu > r - awal:
+                ws.row_dimensions[awal].height = 15.75 * (1 + perlu - (r - awal))
 
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
@@ -587,18 +643,14 @@ def halaman_user():
             if berat is None or berat <= 0:
                 st.info("Masukkan berat kulit (g) lebih dari 0.")
             else:
-                rows = hitung_langkah(df, jenis, tahapan, berat)
+                rows = hitung_langkah(df, jenis, tahapan, berat, info)
                 st.dataframe(tabel_tampil(rows), hide_index=True,
                              use_container_width=True, column_config=KONFIG_TABEL)
                 st.markdown(f"**Total:** {ringkas_satuan(rows)}")
                 st.caption("ml dan L dihitung dari gram dengan asumsi massa jenis 1 g = 1 ml.")
-                w, k = info.get((jenis, tahapan), ("", ""))
-                if w or k:
-                    st.caption(f"Waktu: {w or '-'} menit · Keterangan: {k or '-'}")
                 if st.button("➕ Tambah ke daftar", type="primary"):
                     daftar.append({"tanggal": tanggal_hari_ini(), "jenis": jenis,
                                    "tahapan": tahapan, "berat": float(berat),
-                                   "waktu": w, "keterangan": k,
                                    "rows": rows.to_dict("records")})
                     flash("success", f"✅ Langkah {len(daftar)} ditambahkan: {jenis} / {tahapan}")
 
@@ -616,9 +668,6 @@ def halaman_user():
         with st.expander(judul):
             st.dataframe(tabel_tampil(e["rows"]), hide_index=True,
                          use_container_width=True, column_config=KONFIG_TABEL)
-            if e.get("waktu") or e.get("keterangan"):
-                st.caption(f"Waktu: {e.get('waktu') or '-'} menit · "
-                           f"Keterangan: {e.get('keterangan') or '-'}")
             if st.button("🗑️ Hapus langkah ini", key=f"hapus_{i}"):
                 daftar.pop(i)
                 flash("success", "Langkah dihapus dari daftar.")
