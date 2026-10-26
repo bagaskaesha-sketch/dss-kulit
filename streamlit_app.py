@@ -9,6 +9,7 @@ import hmac
 import io
 import os
 import re
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
@@ -237,62 +238,178 @@ def halaman_developer():
 # ---------------------------------------------------------------------------
 # Interface User
 # ---------------------------------------------------------------------------
+KOL_WAJIB = ["Jenis Kulit", "Tahapan", "Berat Kulit (g)", "Senyawa",
+             "Persen (%)", "Jumlah", "Satuan"]
+KOL_EXPORT = ["Urutan", "Tanggal"] + KOL_WAJIB
+
+
+def tanggal_hari_ini() -> str:
+    return datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%d")  # WIB
+
+
+def hitung_langkah(df: pd.DataFrame, jenis, tahapan, berat) -> pd.DataFrame:
+    h = df[(df["jenis_kulit"] == jenis) & (df["tahapan"] == tahapan)].copy()
+    # berat kulit dalam g -> jumlah senyawa dikonversi ke satuan masing-masing
+    h["jumlah"] = (h["persen"] / 100 * berat * h["satuan"].map(SATUAN).fillna(1)).round(4)
+    return h[["senyawa", "persen", "jumlah", "satuan"]]
+
+
+def ringkas_satuan(rows: pd.DataFrame) -> str:
+    g = rows.groupby("satuan")["jumlah"].sum()
+    return " + ".join(f"{v:,.4f} {k}" for k, v in g.items())
+
+
+def baca_file(f) -> list:
+    """Baca file Excel hasil export sebelumnya menjadi daftar langkah."""
+    xls = pd.ExcelFile(f)
+    sheet = "Detail" if "Detail" in xls.sheet_names else xls.sheet_names[0]
+    d = pd.read_excel(xls, sheet_name=sheet)
+    kurang = [c for c in KOL_WAJIB if c not in d.columns]
+    if kurang:
+        raise ValueError("Format file tidak dikenali, kolom hilang: " + ", ".join(kurang)
+                         + ". Pakai file hasil export terbaru dari aplikasi ini.")
+    d = d.dropna(subset=["Senyawa"])
+    d = d[d["Senyawa"].astype(str).str.strip().str.upper() != "TOTAL"].copy()
+    if "Urutan" not in d:
+        d["Urutan"] = 0
+    if "Tanggal" not in d:
+        d["Tanggal"] = ""
+    d["Urutan"] = d["Urutan"].fillna(0)
+    d["Tanggal"] = d["Tanggal"].fillna("").astype(str)
+    for c in ("Jumlah", "Persen (%)", "Berat Kulit (g)"):
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["Jumlah", "Berat Kulit (g)"])
+    hasil = []
+    kunci = ["Urutan", "Tanggal", "Jenis Kulit", "Tahapan", "Berat Kulit (g)"]
+    for (_, tgl, jenis, tahap, berat), g in d.groupby(kunci, sort=False):
+        rows = [{"senyawa": r["Senyawa"], "persen": r["Persen (%)"],
+                 "jumlah": r["Jumlah"], "satuan": r["Satuan"]} for _, r in g.iterrows()]
+        hasil.append({"tanggal": tgl, "jenis": jenis, "tahapan": tahap,
+                      "berat": float(berat), "rows": rows})
+    if not hasil:
+        raise ValueError("Tidak ada data langkah di file ini.")
+    return hasil
+
+
+def buat_excel(daftar: list) -> bytes:
+    baris = []
+    for i, e in enumerate(daftar, 1):
+        dasar = {"Urutan": i, "Tanggal": e["tanggal"], "Jenis Kulit": e["jenis"],
+                 "Tahapan": e["tahapan"], "Berat Kulit (g)": e["berat"]}
+        for r in e["rows"]:
+            baris.append({**dasar, "Senyawa": r["senyawa"], "Persen (%)": r["persen"],
+                          "Jumlah": r["jumlah"], "Satuan": r["satuan"]})
+        baris.append({**dasar, "Senyawa": "TOTAL", "Persen (%)": None, "Jumlah": None,
+                      "Satuan": ringkas_satuan(pd.DataFrame(e["rows"]))})
+    detail = pd.DataFrame(baris, columns=KOL_EXPORT)
+
+    semua = pd.DataFrame([r for e in daftar for r in e["rows"]])
+    ringkasan = (semua.groupby(["senyawa", "satuan"], as_index=False)["jumlah"].sum()
+                 .round(4).rename(columns={"senyawa": "Senyawa", "satuan": "Satuan",
+                                           "jumlah": "Total Jumlah"}))
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        detail.to_excel(w, sheet_name="Detail", index=False)
+        ringkasan.to_excel(w, sheet_name="Ringkasan", index=False)
+        for ws in w.book.worksheets:
+            for kol in ws.columns:
+                lebar = max(len(str(c.value)) if c.value is not None else 0 for c in kol)
+                ws.column_dimensions[kol[0].column_letter].width = min(lebar + 2, 40)
+    return buf.getvalue()
+
+
 def halaman_user():
     st.title("Hitung Kebutuhan Bahan Kimia")
+    tampil_flash()
+    if "daftar" not in st.session_state:
+        st.session_state["daftar"] = []
+    daftar = st.session_state["daftar"]
+
     try:
         df = ambil_semua()
     except DBError as e:
         st.error(f"❌ {e}")
         return
+
+    # --- Lanjutkan dari file sebelumnya ---
+    with st.expander("📂 Lanjutkan dari file sebelumnya"):
+        st.caption("Upload file Excel hasil export sebelumnya. Langkah di dalamnya "
+                   "dimuat ke daftar, lalu kamu bisa menambah langkah baru dan export ulang.")
+        f = st.file_uploader("File Excel (.xlsx)", type=["xlsx"],
+                             key=f"upl_{st.session_state.get('upl_n', 0)}")
+        if f is not None and st.button("Muat ke daftar"):
+            try:
+                baru = baca_file(f)
+            except Exception as e:  # noqa: BLE001
+                st.error(f"❌ Gagal membaca file: {str(e)[:250]}")
+            else:
+                daftar[:0] = baru  # langkah lama ditaruh di depan
+                st.session_state["upl_n"] = st.session_state.get("upl_n", 0) + 1
+                flash("success", f"✅ {len(baru)} langkah dari file dimuat ke daftar.")
+
+    # --- Hitung satu langkah ---
+    st.subheader("Tambah langkah")
     if df.empty:
         st.info("Belum ada formulasi. Hubungi developer.")
+    else:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            jenis = st.selectbox("Jenis kulit", sorted(df["jenis_kulit"].unique().tolist()),
+                                 index=None, placeholder="Pilih jenis kulit")
+        with c2:
+            tahap_opsi = (list(dict.fromkeys(df[df["jenis_kulit"] == jenis]["tahapan"]))
+                          if jenis else [])
+            tahapan = st.selectbox("Tahapan", tahap_opsi, index=None,
+                                   placeholder="Pilih tahapan")
+        with c3:
+            berat = st.number_input("Berat kulit (g)", min_value=0.0, value=None,
+                                    format="%.3f")
+
+        if jenis and tahapan:
+            if berat is None or berat <= 0:
+                st.info("Masukkan berat kulit (g) lebih dari 0.")
+            else:
+                rows = hitung_langkah(df, jenis, tahapan, berat)
+                st.dataframe(
+                    rows.rename(columns={"senyawa": "Senyawa", "persen": "Persen (%)",
+                                         "jumlah": "Jumlah", "satuan": "Satuan"}),
+                    hide_index=True, use_container_width=True)
+                st.markdown(f"**Total:** {ringkas_satuan(rows)}")
+                st.caption("mL dan L dihitung dari gram dengan asumsi massa jenis 1 g = 1 mL.")
+                if st.button("➕ Tambah ke daftar", type="primary"):
+                    daftar.append({"tanggal": tanggal_hari_ini(), "jenis": jenis,
+                                   "tahapan": tahapan, "berat": float(berat),
+                                   "rows": rows.to_dict("records")})
+                    flash("success", f"✅ Langkah {len(daftar)} ditambahkan: {jenis} / {tahapan}")
+
+    # --- Daftar langkah + export ---
+    st.divider()
+    st.subheader(f"Daftar langkah ({len(daftar)})")
+    if not daftar:
+        st.info("Belum ada langkah. Hitung lalu klik 'Tambah ke daftar'.")
         return
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        jenis = st.selectbox("Jenis kulit", sorted(df["jenis_kulit"].unique().tolist()),
-                             index=None, placeholder="Pilih jenis kulit")
-    with c2:
-        tahap_opsi = (list(dict.fromkeys(df[df["jenis_kulit"] == jenis]["tahapan"]))
-                      if jenis else [])
-        tahapan = st.selectbox("Tahapan", tahap_opsi, index=None,
-                               placeholder="Pilih tahapan")
-    with c3:
-        berat = st.number_input("Berat kulit (g)", min_value=0.0, value=None, format="%.3f")
+    for i, e in enumerate(daftar):
+        judul = f"{i + 1}. {e['jenis']} / {e['tahapan']} · {e['berat']:g} g"
+        if e["tanggal"]:
+            judul += f" · {e['tanggal']}"
+        with st.expander(judul):
+            st.dataframe(
+                pd.DataFrame(e["rows"]).rename(columns={
+                    "senyawa": "Senyawa", "persen": "Persen (%)",
+                    "jumlah": "Jumlah", "satuan": "Satuan"}),
+                hide_index=True, use_container_width=True)
+            if st.button("🗑️ Hapus langkah ini", key=f"hapus_{i}"):
+                daftar.pop(i)
+                flash("success", "Langkah dihapus dari daftar.")
 
-    if not (jenis and tahapan):
-        return
-    if berat is None or berat <= 0:
-        st.info("Masukkan berat kulit (g) lebih dari 0.")
-        return
-
-    hasil = df[(df["jenis_kulit"] == jenis) & (df["tahapan"] == tahapan)].copy()
-    # jumlah dasar (g) lalu dikonversi ke satuan masing-masing senyawa
-    hasil["jumlah"] = (hasil["persen"] / 100 * berat
-                       * hasil["satuan"].map(SATUAN).fillna(1)).round(4)
-    tampil = hasil[["senyawa", "persen", "jumlah", "satuan"]].rename(columns={
-        "senyawa": "Senyawa", "persen": "Persen (%)", "jumlah": "Jumlah", "satuan": "Satuan"})
-    st.dataframe(tampil, hide_index=True, use_container_width=True)
-    per_satuan = hasil.groupby("satuan")["jumlah"].sum()
-    ringkas = " + ".join(f"{v:,.4f} {k}" for k, v in per_satuan.items())
-    st.markdown(f"**Total:** {ringkas} untuk {berat:g} g kulit {jenis} ({tahapan})")
-    st.caption("Satuan mL dan L dihitung dari gram dengan asumsi massa jenis 1 g = 1 mL.")
-
-    # Export xlsx
-    out = pd.DataFrame({
-        "Jenis Kulit": jenis, "Tahapan": tahapan, "Berat Kulit (g)": berat,
-        "Senyawa": hasil["senyawa"].values, "Persen (%)": hasil["persen"].values,
-        "Jumlah": hasil["jumlah"].values, "Satuan": hasil["satuan"].values})
-    baris_total = pd.DataFrame([{
-        "Jenis Kulit": jenis, "Tahapan": tahapan, "Berat Kulit (g)": berat,
-        "Senyawa": "TOTAL", "Persen (%)": None, "Jumlah": None, "Satuan": ringkas}])
-    out = pd.concat([out, baris_total], ignore_index=True)
-    buf = io.BytesIO()
-    out.to_excel(buf, index=False, engine="openpyxl")
-    nama = re.sub(r"[^A-Za-z0-9_-]+", "_", f"{jenis}_{tahapan}")
-    st.download_button("📥 Export ke Excel (.xlsx)", buf.getvalue(),
-                       file_name=f"kebutuhan_kimia_{nama}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button("📥 Export semua langkah ke Excel (.xlsx)", buat_excel(daftar),
+                       file_name=f"rekap_kimia_{tanggal_hari_ini()}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       type="primary")
+    if st.button("Kosongkan daftar"):
+        daftar.clear()
+        flash("success", "Daftar dikosongkan.")
 
 
 # ---------------------------------------------------------------------------
